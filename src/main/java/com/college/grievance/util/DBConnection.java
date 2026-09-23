@@ -1,68 +1,145 @@
 package com.college.grievance.util;
 
 import java.net.URI;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
+import java.sql.Statement;
 
-public class DBConnection {
+public final class DBConnection {
+
+    private DBConnection() {
+    }
 
     static {
         try {
             Class.forName("org.postgresql.Driver");
         } catch (ClassNotFoundException e) {
-            throw new RuntimeException("PostgreSQL JDBC Driver not found", e);
+            throw new ExceptionInInitializerError("PostgreSQL JDBC Driver not found: " + e.getMessage());
         }
     }
 
     public static Connection getConnection() throws SQLException {
+        String configuredUrl = firstNonBlank(
+                System.getenv("DATABASE_URL"),
+                System.getenv("JDBC_DATABASE_URL"),
+                System.getenv("DB_URL")
+        );
 
-        String databaseUrl = System.getenv("DATABASE_URL");
-
-        if (databaseUrl != null && !databaseUrl.isBlank()) {
-
-            try {
-                URI uri = new URI(databaseUrl);
-
-                String host = uri.getHost();
-                int port = uri.getPort();
-
-                if (port == -1) {
-                    port = 5432;
-                }
-
-                String database = uri.getPath();
-
-                String userInfo = uri.getUserInfo();
-                String username = userInfo.substring(0, userInfo.indexOf(':'));
-                String password = userInfo.substring(userInfo.indexOf(':') + 1);
-
-                String jdbcUrl =
-                        "jdbc:postgresql://" +
-                        host + ":" + port + database;
-
-                return DriverManager.getConnection(
-                        jdbcUrl,
-                        username,
-                        password
-                );
-
-            } catch (Exception e) {
-                throw new SQLException(
-                        "Unable to connect to PostgreSQL database",
-                        e
-                );
-            }
+        Connection connection;
+        if (configuredUrl != null) {
+            connection = connectUsingUrl(configuredUrl);
+        } else {
+            connection = connectUsingEnvironmentVariables();
         }
 
-        // Local MySQL connection
-        String url =
-                "jdbc:mysql://localhost:3306/grievance_portal" +
-                "?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true";
+        initializeSchema(connection);
+        return connection;
+    }
 
-        String user = "grievance_user";
-        String password = "grievance123";
+    private static Connection connectUsingUrl(String configuredUrl) throws SQLException {
+        try {
+            if (configuredUrl.startsWith("jdbc:postgresql:")) {
+                return DriverManager.getConnection(configuredUrl);
+            }
 
-        return DriverManager.getConnection(url, user, password);
+            String normalized = configuredUrl.startsWith("postgres://")
+                    ? "postgresql://" + configuredUrl.substring("postgres://".length())
+                    : configuredUrl;
+            URI uri = new URI(normalized);
+            String host = require(uri.getHost(), "database host");
+            int port = uri.getPort() == -1 ? 5432 : uri.getPort();
+            String database = require(uri.getPath(), "database name");
+            String userInfo = require(uri.getUserInfo(), "database credentials");
+            int separator = userInfo.indexOf(':');
+            if (separator < 1) {
+                throw new IllegalArgumentException("database credentials must be username:password");
+            }
+
+            String username = decode(userInfo.substring(0, separator));
+            String password = decode(userInfo.substring(separator + 1));
+            String jdbcUrl = "jdbc:postgresql://" + host + ":" + port + database;
+            if (uri.getRawQuery() != null && !uri.getRawQuery().isBlank()) {
+                jdbcUrl += "?" + uri.getRawQuery();
+            }
+            return DriverManager.getConnection(jdbcUrl, username, password);
+        } catch (Exception e) {
+            throw new SQLException("Unable to parse or connect to DATABASE_URL", e);
+        }
+    }
+
+    private static Connection connectUsingEnvironmentVariables() throws SQLException {
+        String host = firstNonBlank(System.getenv("PGHOST"), System.getenv("DB_HOST"));
+        String database = firstNonBlank(System.getenv("PGDATABASE"), System.getenv("DB_NAME"));
+        String username = firstNonBlank(System.getenv("PGUSER"), System.getenv("DB_USER"));
+        String password = firstNonBlank(System.getenv("PGPASSWORD"), System.getenv("DB_PASSWORD"));
+        String port = firstNonBlank(System.getenv("PGPORT"), System.getenv("DB_PORT"), "5432");
+
+        if (host == null || database == null || username == null || password == null) {
+            throw new SQLException(
+                    "Database is not configured. Set DATABASE_URL on Render, or set "
+                            + "PGHOST, PGPORT, PGDATABASE, PGUSER and PGPASSWORD."
+            );
+        }
+
+        String jdbcUrl = "jdbc:postgresql://" + host + ":" + port + "/" + database;
+        return DriverManager.getConnection(jdbcUrl, username, password);
+    }
+
+    private static void initializeSchema(Connection connection) throws SQLException {
+        try (Statement statement = connection.createStatement()) {
+            statement.executeUpdate("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                        name VARCHAR(100) NOT NULL,
+                        email VARCHAR(120) UNIQUE NOT NULL,
+                        password VARCHAR(255) NOT NULL,
+                        role VARCHAR(20) NOT NULL DEFAULT 'STUDENT'
+                    )
+                    """);
+            statement.executeUpdate("""
+                    CREATE TABLE IF NOT EXISTS complaints (
+                        id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                        complaint_code VARCHAR(30) UNIQUE NOT NULL,
+                        student_name VARCHAR(100) NOT NULL,
+                        student_email VARCHAR(120),
+                        category VARCHAR(80) NOT NULL,
+                        location VARCHAR(120),
+                        description TEXT NOT NULL,
+                        status VARCHAR(30) NOT NULL DEFAULT 'Pending',
+                        admin_remark VARCHAR(500),
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """);
+            statement.executeUpdate("""
+                    INSERT INTO users (name, email, password, role)
+                    VALUES ('System Admin', 'admin@college.com', 'admin123', 'ADMIN'),
+                           ('Demo Student', 'student@college.com', 'student123', 'STUDENT')
+                    ON CONFLICT (email) DO NOTHING
+                    """);
+        }
+    }
+
+    private static String firstNonBlank(String... values) {
+        for (String value : values) {
+            if (value != null && !value.isBlank()) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    private static String require(String value, String label) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException("Missing " + label);
+        }
+        return value;
+    }
+
+    private static String decode(String value) {
+        return URLDecoder.decode(value, StandardCharsets.UTF_8);
     }
 }
