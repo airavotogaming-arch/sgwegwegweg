@@ -23,6 +23,10 @@ Full college-project foundation using Java 17, JSP, Servlets, MySQL and Tomcat 1
 6. Start Tomcat.
 7. Open `http://localhost:8080/StudentGrievancePortal/`
 
+## Render deployment
+
+The Docker image deploys the WAR as Tomcat's `ROOT.war`, so the Render service URL opens the portal directly at `/` rather than requiring `/StudentGrievancePortal/`.
+
 Demo admin: admin@college.com / admin123
 Demo student: student@college.com / student123
 
