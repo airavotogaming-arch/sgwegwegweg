@@ -27,6 +27,7 @@ public class UserDAO {
                 u.id = r.getInt("id");
                 u.name = r.getString("name");
                 u.email = r.getString("email");
+                u.role = r.getString("role");
 
                 return u;
             }
